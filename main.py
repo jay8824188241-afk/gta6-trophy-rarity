@@ -20,11 +20,15 @@ Model (per trophy, standard library only, fully deterministic, no network):
     error.  This stops a fast mover from being extrapolated past any
     plausible ceiling (a story trophy cannot exceed the share of players who
     reach that point in the story).
-  * The median is the logit-average of the two fits, blended a little toward
-    the last observed rate; the persistence weight decays with the horizon
-    (about 0.10 at 4.5 days, about 0.97 at 90 minutes), so short-horizon
-    forecasts stay close to the last read while week-ahead forecasts follow
-    the trend.
+  * The median is the logit-average of the two fits, blended toward the
+    robust trend's fitted value at the last read (not the raw last read:
+    one refresh jump would otherwise drag a short-horizon forecast with
+    it, and the anchor is gated on the leave-last-out trend so a jumped
+    last read is replaced by the trend without it while a genuine last
+    read is kept); the persistence weight decays with the horizon (about
+    0.10 at 4.5 days, about 0.97 at 90 minutes), so short-horizon
+    forecasts stay close to the last read while week-ahead forecasts
+    follow the trend.
   * The spread is honest about the horizon: a random-walk term
     (0.5 * sqrt(days), the house baseline's width) plus the slope's standard
     error times the extrapolation distance, plus the disagreement between
@@ -187,9 +191,39 @@ def forecast_trophy(obs, x_target, horizon_days, jump_std):
 
     # --- Median: average the two fits, blended toward the last read. ---
     ensemble = 0.5 * (trend_logit + sat_logit)
-    last_logit = ys[-1]
+    # Anchor on the robust trend's fitted value at the last read, not the
+    # raw last read: one Exophase refresh jump can drag every rate down at
+    # once, and at short horizons the persistence weight is near 1, so the
+    # raw read would carry the whole forecast with it.
+    last_anchor = a_adj + b_adj * xs[-1]
+    # Outlier gate: if the last read disagrees with the trend fitted
+    # without it by more than the robust cut, it is a refresh jump, so
+    # anchor on the leave-last-out trend instead; a genuine last read
+    # (inside the cut) keeps the full-fit anchor.  The jump leaks into
+    # the full fit's intercept and inflates the slope's standard error
+    # (which shrinks the slope toward zero), so testing against the
+    # leave-last-out fit is what actually separates a jump from a move.
+    if len(obs) >= 3:
+        xs_loo, ys_loo, ws_loo = xs[:-1], ys[:-1], ws[:-1]
+        a_loo, b_loo, se_loo, _sse_loo, xbar_loo = robust_linfit(
+            xs_loo, ys_loo, ws_loo)
+        loo_at_last = a_loo + b_loo * xs[-1]
+        resid_loo = [y - (a_loo + b_loo * x)
+                     for x, y in zip(xs_loo, ys_loo)]
+        scale_loo = sorted(abs(r) for r in resid_loo)[len(resid_loo) // 2]
+        scale_loo = max(scale_loo * 1.4826, 0.05)
+        if abs(ys[-1] - loo_at_last) > 2.0 * scale_loo:
+            if se_loo > 0:
+                t_loo = abs(b_loo) / se_loo
+                shrink_loo = (t_loo * t_loo) / (t_loo * t_loo + 4.0)
+            else:
+                shrink_loo = 1.0 if b_loo != 0.0 else 0.0
+            b_loo_adj = max(-4.0, min(4.0, b_loo * shrink_loo))
+            a_loo_adj = (sum(w * y for y, w in zip(ys_loo, ws_loo))
+                         / sum(ws_loo)) - b_loo_adj * xbar_loo
+            last_anchor = a_loo_adj + b_loo_adj * xs[-1]
     w_persist = math.exp(-horizon_days / PERSIST_TAU_DAYS)
-    median_logit = (1.0 - w_persist) * ensemble + w_persist * last_logit
+    median_logit = (1.0 - w_persist) * ensemble + w_persist * last_anchor
 
     # --- Spread: random walk + slope uncertainty + model disagreement
     #     + past refresh-jump size, combined in quadrature. ---
